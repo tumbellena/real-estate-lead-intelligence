@@ -1,0 +1,5 @@
+# Test-only dependencies for tests/ - kept separate from requirements.txt
+# so the running app's Docker image doesn't carry test tooling it never uses.
+# httpx, pydantic, and anthropic (also needed by the contract tests) already
+# live in requirements.txt - install both files together.
+pytest

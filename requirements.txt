@@ -1,0 +1,55 @@
+# Web framework used to define our API routes (like /health)
+fastapi
+
+# ASGI server that actually runs the FastAPI app and listens for HTTP requests
+uvicorn[standard]
+
+# ORM (Object-Relational Mapper) - lets us talk to the PostgreSQL database
+# using Python classes/objects instead of writing raw SQL by hand
+sqlalchemy
+
+# Async PostgreSQL database driver - the actual library that connects to Postgres.
+# SQLAlchemy uses this under the hood when we do async database calls.
+asyncpg
+
+# Used by FastAPI (and by us) to validate and structure data,
+# e.g. defining what a "Lead" object looks like and what fields it must have
+pydantic
+
+# Powers Pydantic's EmailStr type - the actual email format-checking logic
+email-validator
+
+# Loads variables from a .env file into the environment,
+# so secrets like database passwords aren't hard-coded in the source code
+python-dotenv
+
+# Database migration tool - tracks changes to our table structure over time
+# as a series of version-controlled scripts (see the alembic/ folder)
+alembic
+
+# HTTP client used by the background worker (app/worker.py) to call the
+# mock property/phone/CRM services
+httpx
+
+# Official Anthropic SDK - used by the background worker to call Claude for
+# lead scoring and outreach message drafting
+anthropic
+
+# Retry logic (exponential backoff + jitter) for the worker's calls to
+# property_api, phone_api, Claude, and crm_webhook
+tenacity
+
+# Circuit breaker (stop calling a service that's persistently failing) for
+# the same four calls - see app/circuit_breaker.py
+pybreaker
+
+# Synchronous Postgres driver, used only by app/circuit_breaker.py: pybreaker's
+# storage interface is synchronous, so it can't use the app's asyncpg engine
+psycopg2-binary
+
+# Runs the dead-letter-queue sweep on a schedule (every 15 minutes) inside
+# the worker's own asyncio event loop
+apscheduler
+
+# Structured (JSON) logging - see app/logging_config.py
+structlog

@@ -1,0 +1,19 @@
+# Real secrets - never commit this (only .env.example is committed)
+.env
+
+# Python cache/build artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Editor/OS clutter
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code local state - per-developer permissions and a runtime lock
+# tied to a specific session/PID, not something to share via git
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

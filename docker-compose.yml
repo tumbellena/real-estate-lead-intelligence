@@ -1,0 +1,107 @@
+# Docker Compose lets us define and run multiple containers together.
+# Run "docker compose up" and both services below start, on a shared network
+# where they can reach each other by service name (e.g. "db").
+
+services:
+  # --- The FastAPI application ---
+  api:
+    build: .              # Build the image using the Dockerfile in this directory
+    ports:
+      - "8000:8000"       # <host port>:<container port> - visit http://localhost:8000
+    env_file:
+      - .env               # Load environment variables (DATABASE_URL, etc.) from .env
+    depends_on:
+      - db                 # Start the database before starting the API
+    volumes:
+      - .:/app              # Mount the whole project into the container so edits
+                           # (including Alembic migration files we generate below)
+                           # show up on your machine, not just inside the container
+
+  # --- Mock third-party services ---
+  # These stand in for real vendors (property data, phone validation, CRM)
+  # so the app's integration/enrichment logic can be built and tested
+  # without hitting real APIs. Each one's MODE env var controls how it
+  # behaves - see mocks/README.md - defaulting to "healthy" unless you set
+  # e.g. PROPERTY_API_MODE=broken in .env or your shell before starting.
+  property_api:
+    build: ./mocks/property_api
+    ports:
+      - "8001:8001"        # visit http://localhost:8001/property?address=...
+    environment:
+      MODE: ${PROPERTY_API_MODE:-healthy}
+
+  phone_api:
+    build: ./mocks/phone_api
+    ports:
+      - "8002:8002"        # visit http://localhost:8002/validate?phone=...
+    environment:
+      MODE: ${PHONE_API_MODE:-healthy}
+
+  crm_webhook:
+    build: ./mocks/crm_webhook
+    ports:
+      - "8003:8003"        # POST http://localhost:8003/leads
+    environment:
+      MODE: ${CRM_WEBHOOK_MODE:-healthy}
+
+  # --- Background enrichment worker ---
+  # Same image/codebase as "api" (built from the same Dockerfile), but runs
+  # app/worker.py instead of uvicorn: polls the leads table, calls the mock
+  # services + Claude, and pushes enriched leads to the CRM webhook. A
+  # separate container so a slow enrichment never blocks the API from
+  # answering requests.
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - property_api
+      - phone_api
+      - crm_webhook
+    volumes:
+      - .:/app
+    expose:
+      - "9100"    # internal-only metrics endpoint (see app/worker.py) - no
+                  # "ports:" entry, so it's reachable from other containers
+                  # (api's GET /metrics reads it) but never from the host
+
+  # --- Ops dashboard ---
+  # A separate Streamlit app (dashboard/) that reads directly from Postgres
+  # to show a live operational view: leads processed today, circuit breaker
+  # states, an enrichment trend line, the DLQ, recent events, and kill
+  # switch status. Read-only and independent of the api/worker containers -
+  # it queries the same database, not either of their HTTP APIs.
+  dashboard:
+    build: ./dashboard
+    restart: unless-stopped   # safety net: auto-restart if the process ever dies
+    ports:
+      - "8501:8501"        # visit http://localhost:8501
+    env_file:
+      - .env
+    depends_on:
+      - db
+
+  # --- The PostgreSQL database ---
+  db:
+    image: postgres:16     # Use the official PostgreSQL version 16 image
+    environment:
+      # These env vars are read by the official Postgres image itself
+      # to create the initial database, user, and password.
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5433:5432"        # host:container - using 5433 on the host since 5432 was
+                           # already taken by a local Postgres install. The app
+                           # still talks to Postgres internally via "db:5432".
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Persists database files outside the container, so data survives
+      # "docker compose down" and container restarts.
+
+# Named volume declared here, managed by Docker (stored on your machine,
+# not tied to a specific container's lifecycle).
+volumes:
+  postgres_data:

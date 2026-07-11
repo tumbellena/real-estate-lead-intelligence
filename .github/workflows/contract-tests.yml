@@ -1,0 +1,83 @@
+name: Contract Tests
+
+# Runs on a schedule (not on every push/PR) because the point isn't "did my
+# change break something" - it's "did a dependency change under us without
+# any change of ours at all." property_api/phone_api/crm_webhook are our
+# own mocks, so this also catches accidental drift in them; the Claude test
+# is the one checking a real, un-controlled third-party vendor.
+on:
+  schedule:
+    # Top of every hour, UTC. GitHub's cron scheduler can lag a few minutes
+    # under load - expected and fine at this cadence.
+    - cron: "0 * * * *"
+  workflow_dispatch: {} # lets you run it on demand from the Actions tab instead of waiting up to an hour
+
+# Scheduled jobs can pile up if a run ever hangs past the next trigger -
+# this keeps at most one run going at a time instead of stacking them.
+concurrency:
+  group: contract-tests
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install --no-cache-dir -r requirements.txt -r requirements-test.txt
+
+      - name: Start mock services
+        run: docker compose up -d --build property_api phone_api crm_webhook
+
+      - name: Wait for mock services to be healthy
+        run: |
+          for url in http://localhost:8001/health http://localhost:8002/health http://localhost:8003/health; do
+            echo "Waiting for $url"
+            for i in $(seq 1 30); do
+              if curl -sf "$url" > /dev/null; then
+                echo "  up"
+                break
+              fi
+              if [ "$i" -eq 30 ]; then
+                echo "  never came up"
+                exit 1
+              fi
+              sleep 1
+            done
+          done
+
+      - name: Run contract tests
+        env:
+          PROPERTY_API_URL: http://localhost:8001
+          PHONE_API_URL: http://localhost:8002
+          CRM_WEBHOOK_URL: http://localhost:8003
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: pytest tests/contract -v
+
+      - name: Tear down mock services
+        if: always()
+        run: docker compose down -v
+
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL secret not set - skipping Slack notification"
+            exit 0
+          fi
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sf -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\": \":rotating_light: Contract tests failed on \`${{ github.repository }}\` - <$run_url|view run>\"}" \
+            "$SLACK_WEBHOOK_URL"
