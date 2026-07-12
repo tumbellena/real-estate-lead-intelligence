@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.alerts import send_slack_alert
 from app.database import get_db
 from app.kill_switch import get_kill_switch_status, set_persisted_value
 
@@ -68,5 +69,17 @@ async def toggle_kill_switch(
         admin_username=credentials.username,
         persisted_value=new_value,
         automation_enabled=status_after["automation_enabled"],
+    )
+    # scope=state_word, not None: a HALT and a later re-ENABLE are opposite,
+    # both operationally important ("stop trusting fresh data" vs "we're
+    # back"), and must never suppress each other. Scoping by direction means
+    # each gets its own 15-minute cooldown - so someone flipping it off then
+    # back on within the window still gets both alerts, while mashing the
+    # *same* direction repeatedly is still deduplicated.
+    state_word = "ENABLED" if status_after["automation_enabled"] else "HALTED"
+    await send_slack_alert(
+        "kill_switch_toggled",
+        f":warning: Kill switch flipped by *{credentials.username}* - automation is now *{state_word}*.",
+        scope=state_word,
     )
     return status_after

@@ -26,6 +26,7 @@ from sqlalchemy import create_engine, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from app.alerts import send_slack_alert
 from app.models import CircuitBreakerState, CircuitState
 
 # No configure_logging() call here - app/worker.py (the only process that
@@ -276,7 +277,21 @@ async def call_with_breaker(
     try:
         result = await coro_factory()
     except Exception:
+        state_before = breaker.current_state
         await asyncio.to_thread(_record_failure, breaker, storage)
+        if state_before != pybreaker.STATE_OPEN and breaker.current_state == pybreaker.STATE_OPEN:
+            # Fired here (in the async caller), not from _StateChangeLogger
+            # above: that listener runs synchronously inside the
+            # asyncio.to_thread() call, where there's no event loop handy to
+            # await an HTTP post from. Whether the trip came from 5
+            # consecutive failures (closed -> open) or a failed half-open
+            # trial (half_open -> open), this condition catches both.
+            await send_slack_alert(
+                "circuit_opened",
+                f":rotating_light: Circuit breaker *OPENED* for `{breaker.name}` - the worker "
+                f"will stop calling it for {RESET_TIMEOUT_SECONDS // 60} minutes.",
+                scope=breaker.name,
+            )
         raise
     else:
         await asyncio.to_thread(_record_success, breaker, storage)

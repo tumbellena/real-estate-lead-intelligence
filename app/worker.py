@@ -18,6 +18,10 @@
 # gives it a few more chances over time before giving up for good.
 # The whole loop can be paused without a restart via the kill switch (see
 # app/kill_switch.py) - checked at the top of every iteration below.
+# Slack alerts (see app/alerts.py) fire when a circuit opens, when the
+# error rate or DLQ size crosses a threshold (see check_alert_thresholds),
+# and when a lead is given up on for good - each deduplicated so a
+# condition that stays true doesn't re-page every time it's re-checked.
 import asyncio
 import json
 import os
@@ -33,10 +37,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
 
+from app.alerts import send_slack_alert
 from app.circuit_breaker import build_sync_session_factory, call_with_breaker, make_breaker
 from app.database import AsyncSessionLocal
 from app.kill_switch import is_automation_enabled
@@ -56,7 +61,8 @@ HTTP_TIMEOUT_SECONDS = 30.0
 PROPERTY_API_URL = os.getenv("PROPERTY_API_URL", "http://property_api:8001")
 PHONE_API_URL = os.getenv("PHONE_API_URL", "http://phone_api:8002")
 CRM_WEBHOOK_URL = os.getenv("CRM_WEBHOOK_URL", "http://crm_webhook:8003")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+# SLACK_WEBHOOK_URL itself lives in app/alerts.py now - every Slack alert in
+# this process goes through send_slack_alert() there, for the deduplication.
 
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 _VALID_SCORES = {"hot", "warm", "cold"}
@@ -67,6 +73,15 @@ _VALID_SCORES = {"hot", "warm", "cold"}
 DLQ_SWEEP_INTERVAL_MINUTES = 15
 DLQ_RETRY_DELAY_MINUTES = 15
 DLQ_MAX_ATTEMPTS = 3
+
+# How often to re-check the level-based alert conditions (error rate, DLQ
+# size) - these aren't triggered by a single event the way a circuit
+# opening or a kill switch flip are, so something has to periodically ask
+# "is this still true right now."
+ALERT_CHECK_INTERVAL_MINUTES = 2
+ERROR_RATE_WINDOW_MINUTES = 15
+ERROR_RATE_ALERT_THRESHOLD_PERCENT = 10.0
+DLQ_SIZE_ALERT_THRESHOLD = 20
 
 # How often to log "kill switch engaged, worker paused" while paused - not
 # every poll tick (that would spam the logs every 2 seconds), just often
@@ -491,30 +506,69 @@ async def process_lead(lead_id: uuid.UUID, http_client: httpx.AsyncClient) -> No
         await mark_failed(lead_id, service_name, str(exc))
 
 
-async def send_slack_alert(http_client: httpx.AsyncClient, entry: DeadLetterQueueEntry) -> None:
-    """
-    Posts a Slack alert for a lead the DLQ sweep has given up on. Best
-    effort: if this fails, or SLACK_WEBHOOK_URL isn't configured, we log it
-    and move on rather than letting a notification problem interrupt the
-    sweep - the lead is already recorded as permanently failed either way.
-    """
+async def alert_lead_permanently_failed(http_client: httpx.AsyncClient, entry: DeadLetterQueueEntry) -> None:
+    """Alerts for a lead the DLQ sweep has given up on for good."""
     text = (
         f":rotating_light: Lead `{entry.lead_id}` permanently failed enrichment "
         f"after {entry.attempts} attempts.\n"
         f"Last failing service: *{entry.service_name}*\n"
         f"Error: {entry.error_message}"
     )
-    if not SLACK_WEBHOOK_URL:
-        logger.warning(
-            "slack_alert_skipped", lead_id=entry.lead_id, reason="SLACK_WEBHOOK_URL_not_configured"
+    # scope=lead_id: each lead only ever reaches "permanently failed" once
+    # (there's no re-triggering it), so this scope mainly just keeps it out
+    # of the way of every *other* alert_type's dedup bookkeeping.
+    await send_slack_alert(
+        "lead_permanently_failed", text, scope=str(entry.lead_id), http_client=http_client
+    )
+
+
+async def check_alert_thresholds(http_client: httpx.AsyncClient) -> None:
+    """
+    Runs every ALERT_CHECK_INTERVAL_MINUTES (see main()). Unlike a circuit
+    opening or a kill switch flip, "error rate is too high" and "the DLQ is
+    too big" aren't single events - they're conditions that are either true
+    or not whenever you look, so something has to periodically look.
+    """
+    structlog.contextvars.bind_contextvars(service="alert_checker")
+
+    async with AsyncSessionLocal() as db:
+        window_start = _utcnow() - timedelta(minutes=ERROR_RATE_WINDOW_MINUTES)
+        processed = await db.scalar(
+            select(func.count())
+            .select_from(Lead)
+            .where(
+                Lead.status.in_([LeadStatus.ENRICHED, LeadStatus.FAILED]),
+                Lead.updated_at >= window_start,
+            )
         )
-        return
-    try:
-        response = await http_client.post(SLACK_WEBHOOK_URL, json={"text": text})
-        response.raise_for_status()
-        logger.info("slack_alert_sent", lead_id=entry.lead_id)
-    except Exception:
-        logger.exception("slack_alert_failed", lead_id=entry.lead_id)
+        failed = await db.scalar(
+            select(func.count())
+            .select_from(Lead)
+            .where(Lead.status == LeadStatus.FAILED, Lead.updated_at >= window_start)
+        )
+        dlq_size = await db.scalar(select(func.count()).select_from(DeadLetterQueueEntry))
+
+    error_rate = (failed / processed * 100) if processed else 0.0
+    logger.info(
+        "alert_thresholds_checked",
+        processed=processed, failed=failed, error_rate=round(error_rate, 1), dlq_size=dlq_size,
+    )
+
+    if processed > 0 and error_rate > ERROR_RATE_ALERT_THRESHOLD_PERCENT:
+        await send_slack_alert(
+            "error_rate_high",
+            f":rotating_light: Error rate is *{error_rate:.1f}%* over the last "
+            f"{ERROR_RATE_WINDOW_MINUTES} minutes ({failed}/{processed} leads failed).",
+            http_client=http_client,
+        )
+
+    if dlq_size > DLQ_SIZE_ALERT_THRESHOLD:
+        await send_slack_alert(
+            "dlq_size_high",
+            f":rotating_light: Dead letter queue has *{dlq_size}* unresolved items "
+            f"(threshold: {DLQ_SIZE_ALERT_THRESHOLD}).",
+            http_client=http_client,
+        )
 
 
 async def sweep_dead_letter_queue(http_client: httpx.AsyncClient) -> None:
@@ -555,7 +609,7 @@ async def sweep_dead_letter_queue(http_client: httpx.AsyncClient) -> None:
                     db, entry.lead_id, "dlq_permanently_failed",
                     service_name=entry.service_name, message=entry.error_message,
                 )
-                await send_slack_alert(http_client, entry)
+                await alert_lead_permanently_failed(http_client, entry)
             else:
                 entry.attempts += 1
                 entry.next_retry_at = _utcnow() + timedelta(minutes=DLQ_RETRY_DELAY_MINUTES)
@@ -624,6 +678,13 @@ async def main() -> None:
             trigger=IntervalTrigger(minutes=DLQ_SWEEP_INTERVAL_MINUTES),
             args=[http_client],
             id="sweep_dead_letter_queue",
+            max_instances=1,
+        )
+        scheduler.add_job(
+            check_alert_thresholds,
+            trigger=IntervalTrigger(minutes=ALERT_CHECK_INTERVAL_MINUTES),
+            args=[http_client],
+            id="check_alert_thresholds",
             max_instances=1,
         )
         scheduler.start()
