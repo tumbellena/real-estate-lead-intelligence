@@ -36,6 +36,14 @@ jobs:
       - name: Install test dependencies
         run: pip install --no-cache-dir -r requirements.txt -r requirements-test.txt
 
+      - name: Create .env for docker compose
+        # docker-compose.yml references .env via env_file on the api/worker/
+        # dashboard services. We only ever start the mock services here, but
+        # "docker compose down" (used in teardown) resolves the whole compose
+        # file regardless of which services were started, so .env must exist.
+        # No real secrets needed - just enough for compose to parse env_file.
+        run: cp .env.example .env
+
       - name: Start mock services
         run: docker compose up -d --build property_api phone_api crm_webhook
 
